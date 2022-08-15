@@ -1,6 +1,6 @@
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/auto/options nginx-ech/auto/options
 --- nginx/auto/options	2022-08-08 16:45:15.028345460 -0400
-+++ nginx-ech/auto/options	2022-08-11 15:22:40.561208786 -0400
++++ nginx-ech/auto/options	2022-08-12 15:47:24.874892747 -0400
 @@ -363,6 +363,8 @@
          --with-openssl=*)                OPENSSL="$value"           ;;
          --with-openssl-opt=*)            OPENSSL_OPT="$value"       ;;
@@ -12,8 +12,8 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/auto/options nginx-ech/a
  $0: warning: the \"--with-md5\" option is deprecated"
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_openssl.c nginx-ech/src/event/ngx_event_openssl.c
 --- nginx/src/event/ngx_event_openssl.c	2022-08-08 16:45:15.044346294 -0400
-+++ nginx-ech/src/event/ngx_event_openssl.c	2022-08-11 15:22:40.565208992 -0400
-@@ -9,6 +9,46 @@
++++ nginx-ech/src/event/ngx_event_openssl.c	2022-08-12 15:47:24.874892747 -0400
+@@ -9,6 +9,56 @@
  #include <ngx_core.h>
  #include <ngx_event.h>
  
@@ -45,22 +45,32 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +     * This can be called by applications after the TLS handshake is complete. 
 +     * This works for both client and server.
 +     */
-+    int SSL_ech_get_status(ngx_ssl_conn_t *s)
++    int SSL_ech_get_status(ngx_connection_t *c)
 +    {
++        ngx_ssl_conn_t *s = c->ssl->connection;
 +        if(SSL_ech_accepted(s)) {
 +            long vr=X509_V_OK;
 +            vr=SSL_get_verify_result(s);
 +            if (vr == X509_V_OK ) return SSL_ECH_STATUS_SUCCESS;
 +            else return SSL_ECH_STATUS_BAD_NAME;
 +        }
-+        else
-+            return SSL_ECH_STATUS_FAILED;
++        else {
++            size_t publicname_len;
++            const char *publicname;
++            SSL_get0_ech_name_override(s, &publicname, &publicname_len);
++            if(publicname_len) {
++                ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "ECH status publicname: %.*s", publicname_len, publicname);
++                return SSL_ECH_STATUS_FAILED_ECH;
++            }
++            else
++                return SSL_ECH_STATUS_NOT_TRIED;
++        }
 +    }
 +#endif
  
  #define NGX_SSL_PASSWORD_BUFFER_SIZE  4096
  
-@@ -1085,6 +1125,31 @@
+@@ -1085,6 +1135,31 @@
  
  #endif
  
@@ -68,7 +78,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +    if ((where & SSL_CB_HANDSHAKE_DONE) == SSL_CB_HANDSHAKE_DONE) {
 +        c = ngx_ssl_get_connection((ngx_ssl_conn_t *) ssl_conn);
 +
-+        int echrv=SSL_ech_get_status(c->ssl->connection);
++        int echrv=SSL_ech_get_status(c);
 +        switch (echrv) {
 +            case SSL_ECH_STATUS_NOT_TRIED:
 +                ngx_ssl_error(NGX_LOG_INFO, c->log, 0, "ECH not attempted");
@@ -92,7 +102,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
      if ((where & SSL_CB_ACCEPT_LOOP) == SSL_CB_ACCEPT_LOOP) {
          c = ngx_ssl_get_connection((ngx_ssl_conn_t *) ssl_conn);
  
-@@ -1320,6 +1385,202 @@
+@@ -1320,6 +1395,204 @@
      }
  }
  
@@ -233,6 +243,8 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +        return NGX_ERROR;
 +    }
 +
++    SSL_set_enable_ech_grease(SSL_new(ssl->ctx), 1);
++
 +    if (!SSL_CTX_set1_ech_keys(ssl->ctx, ech_keys)) {
 +        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "load_echkeys SSL_CTX_set1_ech_keys failed");
 +        return NGX_ERROR;
@@ -267,7 +279,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +ngx_ssl_get_ech_status(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 +{
 +    char buf[PATH_MAX];
-+    int echrv=SSL_ech_get_status(c->ssl->connection);
++    int echrv=SSL_ech_get_status(c);
 +    switch (echrv) {
 +    case SSL_ECH_STATUS_NOT_TRIED:
 +        snprintf(buf,PATH_MAX,"not attempted");
@@ -295,7 +307,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
  
  ngx_int_t
  ngx_ssl_dhparam(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *file)
-@@ -4716,7 +4977,6 @@
+@@ -4716,7 +4989,6 @@
      return NGX_OK;
  }
  
@@ -305,7 +317,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
  {
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_openssl.h nginx-ech/src/event/ngx_event_openssl.h
 --- nginx/src/event/ngx_event_openssl.h	2022-08-08 16:45:15.044346294 -0400
-+++ nginx-ech/src/event/ngx_event_openssl.h	2022-08-11 15:22:40.565208992 -0400
++++ nginx-ech/src/event/ngx_event_openssl.h	2022-08-12 15:47:24.874892747 -0400
 @@ -31,6 +31,10 @@
  #include <openssl/rand.h>
  #include <openssl/x509.h>
@@ -341,7 +353,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
  ngx_int_t ngx_ssl_get_curves(ngx_connection_t *c, ngx_pool_t *pool,
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/http/modules/ngx_http_ssl_module.c nginx-ech/src/http/modules/ngx_http_ssl_module.c
 --- nginx/src/http/modules/ngx_http_ssl_module.c	2022-08-08 16:45:15.064347335 -0400
-+++ nginx-ech/src/http/modules/ngx_http_ssl_module.c	2022-08-11 15:22:40.565208992 -0400
++++ nginx-ech/src/http/modules/ngx_http_ssl_module.c	2022-08-12 15:47:24.874892747 -0400
 @@ -212,6 +212,15 @@
        offsetof(ngx_http_ssl_srv_conf_t, session_ticket_keys),
        NULL },
@@ -406,7 +418,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/http/modules/ngx_htt
      }
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/http/modules/ngx_http_ssl_module.h nginx-ech/src/http/modules/ngx_http_ssl_module.h
 --- nginx/src/http/modules/ngx_http_ssl_module.h	2022-08-08 16:45:15.064347335 -0400
-+++ nginx-ech/src/http/modules/ngx_http_ssl_module.h	2022-08-11 15:22:40.565208992 -0400
++++ nginx-ech/src/http/modules/ngx_http_ssl_module.h	2022-08-12 15:47:24.874892747 -0400
 @@ -41,6 +41,9 @@
      ngx_array_t                    *certificate_key_values;
  
