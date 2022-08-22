@@ -1,6 +1,6 @@
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/auto/options nginx-ech/auto/options
 --- nginx/auto/options	2022-08-08 16:45:15.028345460 -0400
-+++ nginx-ech/auto/options	2022-08-12 15:47:24.874892747 -0400
++++ nginx-ech/auto/options	2022-08-19 12:00:38.285553759 -0400
 @@ -363,6 +363,8 @@
          --with-openssl=*)                OPENSSL="$value"           ;;
          --with-openssl-opt=*)            OPENSSL_OPT="$value"       ;;
@@ -10,10 +10,39 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/auto/options nginx-ech/a
          --with-md5=*)
              NGX_POST_CONF_MSG="$NGX_POST_CONF_MSG
  $0: warning: the \"--with-md5\" option is deprecated"
+diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/README.md nginx-ech/README.md
+--- nginx/README.md	1969-12-31 19:00:00.000000000 -0500
++++ nginx-ech/README.md	2022-08-19 12:00:38.285553759 -0400
+@@ -0,0 +1,25 @@
++Based on https://github.com/sftcd/nginx/tree/ECH-experimental, this fork implements Encrypted Client Hello with BoringSSL.
++
++```
++bssl generate-ech -out-ech-config-list echconfiglist.data -out-ech-config main.ech -out-private-key main.key -public-name frontend.example.com -config-id 0
++```
++
++place the *.ech and *.key in the folder of your choice that you configured in your nginx.conf with
++
++```
++http {
++  ssl_echkeydir echkeydir;
++}
++```
++
++place the base64 encoded echconfiglist in your https dns entry ech attribute
++```
++base64 -w 0 echconfiglist.data
++```
++
++tested to work on Chrome Dev 106 with experiment flags #use-dns-https-svcb-alpn, #encrypted-client-hello, #dns-https-svcb and DNS over HTTPS enabled.
++
++
++
++# nginx
++An official read-only mirror of http://hg.nginx.org/nginx/ which is updated hourly. Pull requests on GitHub cannot be accepted and will be automatically closed. The proper way to submit changes to nginx is via the nginx development mailing list, see http://nginx.org/en/docs/contributing_changes.html
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_openssl.c nginx-ech/src/event/ngx_event_openssl.c
 --- nginx/src/event/ngx_event_openssl.c	2022-08-08 16:45:15.044346294 -0400
-+++ nginx-ech/src/event/ngx_event_openssl.c	2022-08-12 15:47:24.874892747 -0400
-@@ -9,6 +9,56 @@
++++ nginx-ech/src/event/ngx_event_openssl.c	2022-08-19 12:00:38.285553759 -0400
+@@ -9,6 +9,59 @@
  #include <ngx_core.h>
  #include <ngx_event.h>
  
@@ -48,6 +77,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +    int SSL_ech_get_status(ngx_connection_t *c)
 +    {
 +        ngx_ssl_conn_t *s = c->ssl->connection;
++
 +        if(SSL_ech_accepted(s)) {
 +            long vr=X509_V_OK;
 +            vr=SSL_get_verify_result(s);
@@ -60,17 +90,34 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +            SSL_get0_ech_name_override(s, &publicname, &publicname_len);
 +            if(publicname_len) {
 +                ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "ECH status publicname: %.*s", publicname_len, publicname);
-+                return SSL_ECH_STATUS_FAILED_ECH;
++                return SSL_ECH_STATUS_FAILED;
 +            }
 +            else
 +                return SSL_ECH_STATUS_NOT_TRIED;
 +        }
 +    }
++
++    static void ssl_trace(int direction, int ssl_ver, int content_type, const void *buf, size_t len, SSL *ssl, void *arg);
 +#endif
  
  #define NGX_SSL_PASSWORD_BUFFER_SIZE  4096
  
-@@ -1085,6 +1135,31 @@
+@@ -387,6 +440,14 @@
+     SSL_CTX_set_mode(ssl->ctx, SSL_MODE_NO_AUTO_CHAIN);
+ #endif
+ 
++#ifndef BSSL_NO_ECH
++#if (NGX_DEBUG)
++    SSL_CTX_set_msg_callback(ssl->ctx, ssl_trace);
++    SSL_CTX_set_msg_callback_arg(ssl->ctx, ssl->log);
++#endif
++#endif
++
++
+     SSL_CTX_set_read_ahead(ssl->ctx, 1);
+ 
+     SSL_CTX_set_info_callback(ssl->ctx, ngx_ssl_info_callback);
+@@ -1085,6 +1146,31 @@
  
  #endif
  
@@ -102,11 +149,184 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
      if ((where & SSL_CB_ACCEPT_LOOP) == SSL_CB_ACCEPT_LOOP) {
          c = ngx_ssl_get_connection((ngx_ssl_conn_t *) ssl_conn);
  
-@@ -1320,6 +1395,204 @@
+@@ -1320,6 +1406,381 @@
      }
  }
  
 +#ifndef BSSL_NO_ECH
++
++
++static const char *ssl_msg_type(int ssl_ver, int msg)
++{
++#ifdef SSL2_VERSION_MAJOR
++  if(ssl_ver == SSL2_VERSION_MAJOR) {
++    switch(msg) {
++      case SSL2_MT_ERROR:
++        return "Error";
++      case SSL2_MT_CLIENT_HELLO:
++        return "Client hello";
++      case SSL2_MT_CLIENT_MASTER_KEY:
++        return "Client key";
++      case SSL2_MT_CLIENT_FINISHED:
++        return "Client finished";
++      case SSL2_MT_SERVER_HELLO:
++        return "Server hello";
++      case SSL2_MT_SERVER_VERIFY:
++        return "Server verify";
++      case SSL2_MT_SERVER_FINISHED:
++        return "Server finished";
++      case SSL2_MT_REQUEST_CERTIFICATE:
++        return "Request CERT";
++      case SSL2_MT_CLIENT_CERTIFICATE:
++        return "Client CERT";
++    }
++  }
++  else
++#endif
++  if(ssl_ver == SSL3_VERSION_MAJOR) {
++    switch(msg) {
++      case SSL3_MT_HELLO_REQUEST:
++        return "Hello request";
++      case SSL3_MT_CLIENT_HELLO:
++        return "Client hello";
++      case SSL3_MT_SERVER_HELLO:
++        return "Server hello";
++#ifdef SSL3_MT_NEWSESSION_TICKET
++      case SSL3_MT_NEWSESSION_TICKET:
++        return "Newsession Ticket";
++#endif
++      case SSL3_MT_CERTIFICATE:
++        return "Certificate";
++      case SSL3_MT_SERVER_KEY_EXCHANGE:
++        return "Server key exchange";
++      case SSL3_MT_CLIENT_KEY_EXCHANGE:
++        return "Client key exchange";
++      case SSL3_MT_CERTIFICATE_REQUEST:
++        return "Request CERT";
++      case SSL3_MT_SERVER_DONE:
++        return "Server finished";
++      case SSL3_MT_CERTIFICATE_VERIFY:
++        return "CERT verify";
++      case SSL3_MT_FINISHED:
++        return "Finished";
++#ifdef SSL3_MT_CERTIFICATE_STATUS
++      case SSL3_MT_CERTIFICATE_STATUS:
++        return "Certificate Status";
++#endif
++#ifdef SSL3_MT_ENCRYPTED_EXTENSIONS
++      case SSL3_MT_ENCRYPTED_EXTENSIONS:
++        return "Encrypted Extensions";
++#endif
++#ifdef SSL3_MT_SUPPLEMENTAL_DATA
++      case SSL3_MT_SUPPLEMENTAL_DATA:
++        return "Supplemental data";
++#endif
++#ifdef SSL3_MT_END_OF_EARLY_DATA
++      case SSL3_MT_END_OF_EARLY_DATA:
++        return "End of early data";
++#endif
++#ifdef SSL3_MT_KEY_UPDATE
++      case SSL3_MT_KEY_UPDATE:
++        return "Key update";
++#endif
++#ifdef SSL3_MT_NEXT_PROTO
++      case SSL3_MT_NEXT_PROTO:
++        return "Next protocol";
++#endif
++#ifdef SSL3_MT_MESSAGE_HASH
++      case SSL3_MT_MESSAGE_HASH:
++        return "Message hash";
++#endif
++    }
++  }
++  return "Unknown";
++}
++
++static const char *tls_rt_type(int type)
++{
++  switch(type) {
++#ifdef SSL3_RT_HEADER
++  case SSL3_RT_HEADER:
++    return "TLS header";
++#endif
++  case SSL3_RT_CHANGE_CIPHER_SPEC:
++    return "TLS change cipher";
++  case SSL3_RT_ALERT:
++    return "TLS alert";
++  case SSL3_RT_HANDSHAKE:
++    return "TLS handshake";
++  case SSL3_RT_APPLICATION_DATA:
++    return "TLS app data";
++  case SSL3_RT_CLIENT_HELLO_INNER:
++    return "TLS client hello inner";
++  default:
++    return "TLS Unknown";
++  }
++}
++
++/*
++ * Our callback from the SSL/TLS layers.
++ */
++static void ssl_trace(int direction, int ssl_ver, int content_type, const void *buf, size_t len, SSL *ssl, void *arg)
++{
++    char unknown[32];
++    const char *verstr = NULL;
++    char pbuf[6144] = "";
++    char hex[4] = "";
++    ngx_log_t *log = arg;
++    switch(ssl_ver) {
++        case TLS1_1_VERSION:
++            verstr = "TLSv1.1";
++            break;
++        case TLS1_2_VERSION:
++            verstr = "TLSv1.2";
++            break;
++        case TLS1_3_VERSION:
++            verstr = "TLSv1.3";
++            break;
++        case SSL2_VERSION:
++            verstr = "SSLv2";
++            break;
++        case SSL3_VERSION:
++            verstr = "SSLv3";
++            break;
++        case 0:
++            break;
++        default:
++            snprintf(unknown, sizeof(unknown), "(%x)", ssl_ver);
++            verstr = unknown;
++            break;
++    }
++    if(ssl_ver) {
++        const char *msg_name, *tls_rt_name;
++        int msg_type;
++        ssl_ver >>= 8; //check the upper 8 bits only below always pass-up content-type as 0. But the interesting message-type is at 'buf[0]'.
++        if(ssl_ver == SSL3_VERSION_MAJOR && content_type)
++            tls_rt_name = tls_rt_type(content_type);
++        else
++            tls_rt_name = "";
++        if(content_type == SSL3_RT_CHANGE_CIPHER_SPEC) {
++            msg_type = *(char *)buf;
++            msg_name = "Change cipher spec";
++        }
++        else if(content_type == SSL3_RT_ALERT) {
++            msg_type = (((char *)buf)[0] << 8) + ((char *)buf)[1];
++            msg_name = SSL_alert_desc_string_long(msg_type);
++        }
++        else {
++            msg_type = *(char *)buf;
++            msg_name = ssl_msg_type(ssl_ver, msg_type);
++        }
++        for(size_t i=0; i < len && i < sizeof(pbuf)/2; i++) {
++            if(snprintf(hex, sizeof(hex), "%02hhX", ((unsigned char *)buf)[i]) < 0)
++                break;
++            strcat(pbuf, hex);
++        }
++        ngx_log_debug8(NGX_LOG_DEBUG_EVENT, log, 0, "ssl_trace %s(%d) (%s), %s, %s (%d:%d): %d", verstr, ssl_ver, direction?">>":"<<", tls_rt_name, msg_name, msg_type, content_type, (int)len);
++        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, log, 0, "ssl_trace %s\n", pbuf);
++    }
++    //ngx_ssl_error(NGX_LOG_NOTICE, log, 0, "%s", pbuf);
++}
 +
 +uint8_t *readfile(char *filepath, size_t *rd) {
 +    FILE *fptr;
@@ -233,9 +453,11 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +    }
 +
 +    for (int i=0; i<map_len; i++) {
++        free(map[i]);
 +        free(array[i * 2]);
 +        free(array[i * 2 + 1]);
 +    }
++    free(map);
 +    free(array);
 +
 +    if (somekeyworked==0) {
@@ -243,7 +465,9 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
 +        return NGX_ERROR;
 +    }
 +
-+    SSL_set_enable_ech_grease(SSL_new(ssl->ctx), 1);
++    SSL *ssl_ = SSL_new(ssl->ctx);
++    SSL_set_enable_ech_grease(ssl_, 1);
++    SSL_free(ssl_);
 +
 +    if (!SSL_CTX_set1_ech_keys(ssl->ctx, ech_keys)) {
 +        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "load_echkeys SSL_CTX_set1_ech_keys failed");
@@ -307,7 +531,21 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
  
  ngx_int_t
  ngx_ssl_dhparam(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *file)
-@@ -4716,7 +4989,6 @@
+@@ -1668,6 +2129,13 @@
+ 
+     c->ssl = sc;
+ 
++#ifndef BSSL_NO_ECH
++#if (NGX_DEBUG)
++    SSL_set_msg_callback(sc->connection, ssl_trace);
++    SSL_set_msg_callback_arg(sc->connection, c->log);
++#endif
++#endif
++
+     return NGX_OK;
+ }
+ 
+@@ -4716,7 +5184,6 @@
      return NGX_OK;
  }
  
@@ -317,7 +555,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
  {
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_openssl.h nginx-ech/src/event/ngx_event_openssl.h
 --- nginx/src/event/ngx_event_openssl.h	2022-08-08 16:45:15.044346294 -0400
-+++ nginx-ech/src/event/ngx_event_openssl.h	2022-08-12 15:47:24.874892747 -0400
++++ nginx-ech/src/event/ngx_event_openssl.h	2022-08-19 12:00:38.285553759 -0400
 @@ -31,6 +31,10 @@
  #include <openssl/rand.h>
  #include <openssl/x509.h>
@@ -353,7 +591,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/event/ngx_event_open
  ngx_int_t ngx_ssl_get_curves(ngx_connection_t *c, ngx_pool_t *pool,
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/http/modules/ngx_http_ssl_module.c nginx-ech/src/http/modules/ngx_http_ssl_module.c
 --- nginx/src/http/modules/ngx_http_ssl_module.c	2022-08-08 16:45:15.064347335 -0400
-+++ nginx-ech/src/http/modules/ngx_http_ssl_module.c	2022-08-12 15:47:24.874892747 -0400
++++ nginx-ech/src/http/modules/ngx_http_ssl_module.c	2022-08-19 12:00:38.285553759 -0400
 @@ -212,6 +212,15 @@
        offsetof(ngx_http_ssl_srv_conf_t, session_ticket_keys),
        NULL },
@@ -418,7 +656,7 @@ diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/http/modules/ngx_htt
      }
 diff -Nwaur '--exclude=.git' '--exclude=.history' nginx/src/http/modules/ngx_http_ssl_module.h nginx-ech/src/http/modules/ngx_http_ssl_module.h
 --- nginx/src/http/modules/ngx_http_ssl_module.h	2022-08-08 16:45:15.064347335 -0400
-+++ nginx-ech/src/http/modules/ngx_http_ssl_module.h	2022-08-12 15:47:24.874892747 -0400
++++ nginx-ech/src/http/modules/ngx_http_ssl_module.h	2022-08-19 12:00:38.285553759 -0400
 @@ -41,6 +41,9 @@
      ngx_array_t                    *certificate_key_values;
  
